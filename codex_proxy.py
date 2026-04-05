@@ -615,26 +615,34 @@ def resolve_manual_auth_request(
     returned_state: str,
     auth_context_token: str | None,
 ) -> dict[str, Any]:
-    try:
-        return validate_auth_request(expected_mode="manual", returned_state=returned_state)
-    except HTTPException as exc:
-        auth_context = decode_auth_context(auth_context_token)
-        if not auth_context:
-            raise exc
-
-        if auth_context.get("mode") != "manual":
-            raise exc
-
-        if auth_context.get("state") != returned_state:
-            raise exc
-
-        if auth_request_is_expired(auth_context):
+    cleanup_expired_auth_requests()
+    auth_request = get_auth_request_by_state(returned_state)
+    if auth_request:
+        if auth_request_is_expired(auth_request):
+            clear_auth_request(returned_state)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="O link de login expirou. Gere um novo QR code em /auth/manual.",
-            ) from exc
+            )
+        return auth_request
 
-        return auth_context
+    auth_context = decode_auth_context(auth_context_token)
+    if not auth_context or auth_context.get("state") != returned_state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Nenhum login pendente foi encontrado para esse retorno. "
+                "Se o servidor reiniciou ou o fluxo expirou, gere um novo link em /auth/manual."
+            ),
+        )
+
+    if auth_request_is_expired(auth_context):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="O link de login expirou. Gere um novo QR code em /auth/manual.",
+        )
+
+    return auth_context
 
 
 def validate_auth_request(
