@@ -249,7 +249,16 @@ def clear_failed_panel_logins(client_address: str) -> None:
 
 
 def ensure_session_dir() -> None:
-    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                f"Nao foi possivel preparar o diretorio da sessao em {SESSION_FILE.parent}. "
+                f"Verifique as permissoes do volume ou do caminho configurado. ({exc})"
+            ),
+        ) from exc
 
 
 def load_session() -> dict[str, Any] | None:
@@ -274,11 +283,25 @@ def save_session(session_data: dict[str, Any]) -> None:
     temp_file = SESSION_FILE.with_suffix(f"{SESSION_FILE.suffix}.tmp")
 
     with session_lock:
-        temp_file.write_text(
-            json.dumps(session_data, indent=2, ensure_ascii=True),
-            encoding="utf-8",
-        )
-        os.replace(temp_file, SESSION_FILE)
+        try:
+            temp_file.write_text(
+                json.dumps(session_data, indent=2, ensure_ascii=True),
+                encoding="utf-8",
+            )
+            os.replace(temp_file, SESSION_FILE)
+        except OSError as exc:
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    f"Nao foi possivel salvar a sessao em {SESSION_FILE}. "
+                    f"Verifique as permissoes do volume ou do caminho configurado. ({exc})"
+                ),
+            ) from exc
         try:
             os.chmod(SESSION_FILE, 0o600)
         except OSError:
@@ -287,8 +310,17 @@ def save_session(session_data: dict[str, Any]) -> None:
 
 def clear_session() -> None:
     with session_lock:
-        if SESSION_FILE.exists():
-            SESSION_FILE.unlink()
+        try:
+            if SESSION_FILE.exists():
+                SESSION_FILE.unlink()
+        except OSError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    f"Nao foi possivel remover a sessao em {SESSION_FILE}. "
+                    f"Verifique as permissoes do volume ou do caminho configurado. ({exc})"
+                ),
+            ) from exc
 
 
 def decode_jwt_payload(token: str) -> dict[str, Any]:

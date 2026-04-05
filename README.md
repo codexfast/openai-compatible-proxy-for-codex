@@ -213,6 +213,8 @@ docker compose up -d --build
 
 By default, the compose file stores session data in `./data`.
 
+If you change `SESSION_FILE` or mount a custom volume, make sure the container can write to that path.
+
 ## Coolify
 
 This repository is ready to deploy on Coolify using the included `Dockerfile` or `docker-compose.yml`.
@@ -235,11 +237,14 @@ Recommended setup:
 
 If the direct callback flow is not accepted by the upstream auth flow, use the manual login mode from the panel and paste the final callback URL there.
 
+If manual login fails while saving the session, the most common cause is a volume permission issue on `/app/data`. Confirm that the mounted persistent storage is writable by the container.
+
 ## Notes
 
 - `/v1/models` prefers dynamic discovery from upstream endpoints and falls back to the local compatibility list when discovery is unavailable.
 - The upstream authentication and response formats may change over time.
 - The session file contains live credentials. Keep it outside version control and use restricted permissions.
+- In container deployments, `SESSION_FILE` must point to a writable path. The default Docker image expects `/app/data` to be writable when persistence is enabled.
 
 ## Development Notes
 

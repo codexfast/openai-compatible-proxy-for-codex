@@ -17,11 +17,7 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY codex_proxy.py ./codex_proxy.py
 
-RUN useradd --create-home --shell /usr/sbin/nologin appuser \
-    && mkdir -p /app/data \
-    && chown -R appuser:appuser /app
-
-USER appuser
+RUN mkdir -p /app/data
 
 EXPOSE 8000
 
