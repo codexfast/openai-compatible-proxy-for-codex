@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import hmac
 import html
 import json
 import os
@@ -47,6 +48,9 @@ PANEL_TOKEN_WAS_GENERATED = not bool(os.getenv("PANEL_ACCESS_TOKEN", "").strip()
 PANEL_SESSION_COOKIE_NAME = os.getenv(
     "PANEL_SESSION_COOKIE_NAME", "codex_panel_session"
 ).strip()
+AUTH_CONTEXT_SECRET = (
+    os.getenv("AUTH_CONTEXT_SECRET", "").strip() or PANEL_ACCESS_TOKEN
+).encode("utf-8")
 PANEL_SESSION_TTL_SECONDS = int(os.getenv("PANEL_SESSION_TTL_SECONDS", "43200"))
 PANEL_RATE_LIMIT_MAX_ATTEMPTS = int(
     os.getenv("PANEL_RATE_LIMIT_MAX_ATTEMPTS", "6")
@@ -94,7 +98,7 @@ app = FastAPI(title="Codex OpenAI Compatibility Proxy")
 
 session_lock = Lock()
 pending_auth_lock = Lock()
-pending_auth: dict[str, Any] = {}
+pending_auth: dict[str, dict[str, Any]] = {}
 panel_session_lock = Lock()
 panel_rate_limit_lock = Lock()
 panel_sessions: dict[str, dict[str, Any]] = {}
@@ -495,23 +499,41 @@ def create_auth_request(redirect_uri: str, mode: str) -> dict[str, Any]:
         "created_at": now_ts(),
     }
 
+    cleanup_expired_auth_requests()
     with pending_auth_lock:
-        pending_auth.clear()
-        pending_auth.update(auth_request)
+        pending_auth[state] = auth_request
 
     return auth_request
 
 
-def current_auth_request() -> dict[str, Any] | None:
+def get_auth_request_by_state(state: str) -> dict[str, Any] | None:
     with pending_auth_lock:
-        if not pending_auth:
+        auth_request = pending_auth.get(state)
+        if not auth_request:
             return None
-        return dict(pending_auth)
+        return dict(auth_request)
 
 
-def clear_auth_request() -> None:
+def current_auth_request(mode: str | None = None) -> dict[str, Any] | None:
+    cleanup_expired_auth_requests()
     with pending_auth_lock:
-        pending_auth.clear()
+        candidates = [
+            auth_request
+            for auth_request in pending_auth.values()
+            if mode is None or auth_request.get("mode") == mode
+        ]
+        if not candidates:
+            return None
+        latest = max(candidates, key=lambda item: int(item.get("created_at", 0)))
+        return dict(latest)
+
+
+def clear_auth_request(state: str | None = None) -> None:
+    with pending_auth_lock:
+        if state is None:
+            pending_auth.clear()
+            return
+        pending_auth.pop(state, None)
 
 
 def auth_request_is_expired(auth_request: dict[str, Any]) -> bool:
@@ -519,6 +541,17 @@ def auth_request_is_expired(auth_request: dict[str, Any]) -> bool:
     if not isinstance(created_at, int):
         return True
     return created_at + AUTH_REQUEST_TTL_SECONDS < now_ts()
+
+
+def cleanup_expired_auth_requests() -> None:
+    with pending_auth_lock:
+        expired_states = [
+            state
+            for state, auth_request in pending_auth.items()
+            if auth_request_is_expired(auth_request)
+        ]
+        for state in expired_states:
+            pending_auth.pop(state, None)
 
 
 def build_auth_url_from_request(auth_request: dict[str, Any]) -> str:
@@ -529,15 +562,94 @@ def build_auth_url_from_request(auth_request: dict[str, Any]) -> str:
     )
 
 
+def encode_auth_context(auth_request: dict[str, Any]) -> str:
+    payload = {
+        "state": auth_request.get("state"),
+        "code_verifier": auth_request.get("code_verifier"),
+        "redirect_uri": auth_request.get("redirect_uri"),
+        "mode": auth_request.get("mode"),
+        "created_at": auth_request.get("created_at"),
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("utf-8").rstrip("=")
+    signature = hmac.new(
+        AUTH_CONTEXT_SECRET,
+        payload_b64.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload_b64}.{signature}"
+
+
+def decode_auth_context(auth_context_token: str | None) -> dict[str, Any] | None:
+    if not auth_context_token:
+        return None
+
+    try:
+        payload_b64, signature = auth_context_token.split(".", 1)
+    except ValueError:
+        return None
+
+    expected_signature = hmac.new(
+        AUTH_CONTEXT_SECRET,
+        payload_b64.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not secrets.compare_digest(signature, expected_signature):
+        return None
+
+    padding = len(payload_b64) % 4
+    if padding:
+        payload_b64 += "=" * (4 - padding)
+
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def resolve_manual_auth_request(
+    returned_state: str,
+    auth_context_token: str | None,
+) -> dict[str, Any]:
+    try:
+        return validate_auth_request(expected_mode="manual", returned_state=returned_state)
+    except HTTPException as exc:
+        auth_context = decode_auth_context(auth_context_token)
+        if not auth_context:
+            raise exc
+
+        if auth_context.get("mode") != "manual":
+            raise exc
+
+        if auth_context.get("state") != returned_state:
+            raise exc
+
+        if auth_request_is_expired(auth_context):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="O link de login expirou. Gere um novo QR code em /auth/manual.",
+            ) from exc
+
+        return auth_context
+
+
 def validate_auth_request(
     expected_mode: str,
     returned_state: str,
 ) -> dict[str, Any]:
-    auth_request = current_auth_request()
+    cleanup_expired_auth_requests()
+    auth_request = get_auth_request_by_state(returned_state)
     if not auth_request:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Nenhum login pendente foi encontrado. Gere um novo link de acesso.",
+            detail=(
+                "Nenhum login pendente foi encontrado para esse retorno. "
+                "Se o servidor reiniciou ou o fluxo expirou, gere um novo link em /auth/manual."
+            ),
         )
 
     if auth_request.get("mode") != expected_mode:
@@ -547,7 +659,7 @@ def validate_auth_request(
         )
 
     if auth_request_is_expired(auth_request):
-        clear_auth_request()
+        clear_auth_request(returned_state)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="O link de login expirou. Gere um novo QR code em /auth/login.",
@@ -593,7 +705,7 @@ def exchange_auth_code(auth_code: str, auth_request: dict[str, Any]) -> dict[str
 
     session_data = build_session_from_token_response(response.json())
     save_session(session_data)
-    clear_auth_request()
+    clear_auth_request(auth_request.get("state"))
     reset_models_state()
     return session_data
 
@@ -1931,6 +2043,7 @@ def render_auth_connect_page(auth_url: str) -> str:
 def render_manual_auth_page(
     auth_url: str,
     manual_redirect_uri: str,
+    auth_context_token: str,
     error_message: str | None = None,
 ) -> str:
     auth_url_json = json.dumps(auth_url)
@@ -1973,6 +2086,7 @@ def render_manual_auth_page(
           </div>
 
           <form method=\"post\" action=\"/auth/manual\" class=\"mt-6 space-y-4\">
+            <input type=\"hidden\" name=\"auth_context\" value=\"{escape_html(auth_context_token)}\">
             {error_block}
             <label class=\"block\">
               <span class=\"mb-2 block text-sm font-medium text-zinc-300\">Cole a URL final de retorno</span>
@@ -2171,7 +2285,14 @@ async def auth_manual_page(request: Request):
 
     auth_request = create_auth_request(redirect_uri=MANUAL_REDIRECT_URI, mode="manual")
     auth_url = build_auth_url_from_request(auth_request)
-    return HTMLResponse(render_manual_auth_page(auth_url, MANUAL_REDIRECT_URI))
+    auth_context_token = encode_auth_context(auth_request)
+    return HTMLResponse(
+        render_manual_auth_page(
+            auth_url,
+            MANUAL_REDIRECT_URI,
+            auth_context_token=auth_context_token,
+        )
+    )
 
 
 @app.post("/auth/manual", response_class=HTMLResponse)
@@ -2180,25 +2301,25 @@ async def auth_manual_submit(request: Request):
     raw_body = (await request.body()).decode("utf-8", errors="ignore")
     form_data = parse_qs(raw_body)
     returned_url = form_data.get("returned_url", [""])[0].strip()
+    auth_context_token = form_data.get("auth_context", [""])[0].strip()
 
-    auth_request = current_auth_request()
+    auth_request = decode_auth_context(auth_context_token) or current_auth_request("manual")
     if not auth_request or auth_request.get("mode") != "manual":
         auth_request = create_auth_request(redirect_uri=MANUAL_REDIRECT_URI, mode="manual")
 
     auth_url = build_auth_url_from_request(auth_request)
+    auth_context_token = encode_auth_context(auth_request)
 
     try:
         auth_code, auth_state = extract_code_and_state_from_returned_url(returned_url)
-        validated_auth_request = validate_auth_request(
-            expected_mode="manual",
-            returned_state=auth_state,
-        )
+        validated_auth_request = resolve_manual_auth_request(auth_state, auth_context_token)
         exchange_auth_code(auth_code, validated_auth_request)
     except HTTPException as exc:
         return HTMLResponse(
             render_manual_auth_page(
                 auth_url=auth_url,
                 manual_redirect_uri=MANUAL_REDIRECT_URI,
+                auth_context_token=auth_context_token,
                 error_message=str(exc.detail),
             ),
             status_code=exc.status_code,
