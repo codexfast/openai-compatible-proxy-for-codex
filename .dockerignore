@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.venv/
+venv/
+env/
+.env
+.env.*
+.ENV
+codex_session.json
+data/
+README.md

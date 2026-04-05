@@ -1,0 +1,21 @@
+services:
+  codex-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${APP_BIND_PORT:-8000}:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      CODEX_REDIRECT_URI: ${CODEX_REDIRECT_URI:-http://localhost:8000/auth/callback}
+      CODEX_MANUAL_REDIRECT_URI: ${CODEX_MANUAL_REDIRECT_URI:-http://localhost:1455/auth/callback}
+      SESSION_FILE: /app/data/codex_session.json
+      PANEL_ACCESS_TOKEN: ${PANEL_ACCESS_TOKEN:-change-me}
+      PROXY_API_KEY: ${PROXY_API_KEY:-change-me}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      PANEL_SECURE_COOKIE: ${PANEL_SECURE_COOKIE:-false}
+    volumes:
+      - ./data:/app/data
