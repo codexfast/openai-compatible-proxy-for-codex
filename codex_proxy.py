@@ -1092,15 +1092,13 @@ def build_chat_payload(openai_body: dict[str, Any]) -> tuple[dict[str, Any], str
         "model": resolve_requested_upstream_model(openai_body.get("model")),
         "store": False,
         "stream": True,
+        "instructions": "\n\n".join(instructions) if instructions else "",
         "input": input_items,
         "text": {"verbosity": "medium"},
         "include": ["reasoning.encrypted_content"],
         "tool_choice": openai_body.get("tool_choice", "auto"),
         "parallel_tool_calls": openai_body.get("parallel_tool_calls", True),
     }
-
-    if instructions:
-        payload["instructions"] = "\n\n".join(instructions)
 
     max_output_tokens = openai_body.get("max_completion_tokens")
     if max_output_tokens is None:
@@ -1160,10 +1158,15 @@ def normalize_responses_input(raw_input: Any) -> list[dict[str, Any]]:
 
 
 def build_responses_payload(openai_body: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    instructions = openai_body.get("instructions")
+    if not isinstance(instructions, str):
+        instructions = ""
+
     payload: dict[str, Any] = {
         "model": resolve_requested_upstream_model(openai_body.get("model")),
         "store": bool(openai_body.get("store", False)),
         "stream": True,
+        "instructions": instructions,
         "input": normalize_responses_input(openai_body.get("input")),
         "text": openai_body.get("text")
         if isinstance(openai_body.get("text"), dict)
@@ -1172,9 +1175,6 @@ def build_responses_payload(openai_body: dict[str, Any]) -> tuple[dict[str, Any]
         "tool_choice": openai_body.get("tool_choice", "auto"),
         "parallel_tool_calls": openai_body.get("parallel_tool_calls", True),
     }
-
-    if openai_body.get("instructions"):
-        payload["instructions"] = openai_body["instructions"]
 
     max_output_tokens = openai_body.get("max_output_tokens")
     if max_output_tokens is not None:
@@ -1245,10 +1245,26 @@ def post_upstream(payload: dict[str, Any]):
 
     detail = "sem resposta"
     if last_response is not None:
+        detail_parts: list[str] = []
         try:
-            detail = last_response.content.decode("utf-8", errors="replace")[:800]
+            body_text = last_response.text[:800]
+            if body_text:
+                detail_parts.append(body_text)
         except Exception:  # noqa: BLE001
-            detail = str(last_response)[:800]
+            pass
+
+        if not detail_parts:
+            try:
+                body_text = last_response.content.decode("utf-8", errors="replace")[:800]
+                if body_text:
+                    detail_parts.append(body_text)
+            except Exception:  # noqa: BLE001
+                pass
+
+        if not detail_parts:
+            detail_parts.append(f"HTTP {last_response.status_code}")
+
+        detail = " | ".join(detail_parts)
 
     raise HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
